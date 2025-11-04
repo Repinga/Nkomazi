@@ -1,0 +1,1483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Nkomazi Link Up</title>
+
+  <!-- Firebase SDKs -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.1/firebase-app.js";
+    import { getAnalytics } from "https://www.gstatic.com/firebasejs/10.13.1/firebase-analytics.js";
+    import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, sendEmailVerification, sendPasswordResetEmail, onAuthStateChanged, signOut, updateProfile, setPersistence, browserLocalPersistence } from "https://www.gstatic.com/firebasejs/10.13.1/firebase-auth.js";
+    import { getFirestore, collection, addDoc, setDoc, doc, getDoc, getDocs, query, where, orderBy, serverTimestamp, onSnapshot, updateDoc, arrayUnion, arrayRemove, deleteDoc, Timestamp, deleteField, limit, startAfter, increment } from "https://www.gstatic.com/firebasejs/10.13.1/firebase-firestore.js";
+    import { getStorage, ref, uploadBytes, getDownloadURL, uploadBytesResumable } from "https://www.gstatic.com/firebasejs/10.13.1/firebase-storage.js";
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyAqwJx1QuTK_06sBZ1RIjBcJdTtQ8kCGLo",
+      authDomain: "nkomazi-link-up.firebaseapp.com",
+      projectId: "nkomazi-link-up",
+      storageBucket: "nkomazi-link-up.firebasestorage.app",
+      messagingSenderId: "606019328651",
+      appId: "1:606019328651:web:d20c47572ed3a3e6b5d28e",
+      measurementId: "G-PQDFQCFB1R"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const analytics = getAnalytics(app);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+    const storage = getStorage(app);
+
+    let currentUser = null;
+    let feedUnsub = null;
+    let followingCache = [];
+    let commentUnsub = {};
+    let lastPostDoc = null;
+    let loadingFeed = false;
+    const POSTS_PER_PAGE = 5;
+
+    // === CHAT STATE ===
+    let chatListUnsub = null;
+    let activeChatUnsub = null;
+    let activeChatId = null;
+    let replyToMessage = null;
+    let typingTimeout = null;
+    let notificationUnsub = null;
+    let seenObserver = null;
+    let mediaRecorder = null;
+    let audioChunks = [];
+
+    setPersistence(auth, browserLocalPersistence);
+
+    // === REACTIONS ===
+    const reactionEmojis = {
+      'Like': 'Like',
+      'Love': 'Love',
+      'Haha': 'Haha',
+      'Angry': 'Angry',
+      'Disagree': 'Disagree',
+      'Congrats': 'Congrats',
+      'Support': 'Support'
+    };
+
+    // === EMOJI PICKER DATA ===
+    const emojiCategories = {
+      'Smileys': ['Smile', 'Grin', 'Laugh', 'Wink', 'Heart Eyes', 'Kissing', 'Thinking', 'Crying', 'Rage', 'Sunglasses'],
+      'Animals': ['Dog', 'Cat', 'Panda', 'Tiger', 'Monkey', 'Frog', 'Chicken', 'Penguin', 'Koala', 'Unicorn'],
+      'Food': ['Pizza', 'Burger', 'Taco', 'Sushi', 'Cake', 'Ice Cream', 'Coffee', 'Beer', 'Wine', 'Watermelon'],
+      'Objects': ['Phone', 'Laptop', 'Camera', 'Light Bulb', 'Key', 'Lock', 'Hammer', 'Wrench', 'Rocket', 'Globe'],
+      'Symbols': ['Heart', 'Broken Heart', 'Fire', '100', 'Check Mark', 'Cross Mark', 'Star', 'Sparkles', 'Warning', 'Party Popper']
+    };
+
+    // === BACKGROUND SLIDESHOW ===
+    const bgImages = ['b1.jpg', 'b2.jpg', 'b3.jpg'];
+    let currentBg = 0;
+    const body = document.body;
+    function changeBackground() {
+      body.style.backgroundImage = `url('${bgImages[currentBg]}')`;
+      currentBg = (currentBg + 1) % bgImages.length;
+    }
+    document.addEventListener('DOMContentLoaded', () => {
+      bgImages.forEach(src => { const img = new Image(); img.src = src; });
+      changeBackground();
+      setInterval(changeBackground, 5000);
+
+      document.getElementById('authContainer').style.display = 'block';
+      document.getElementById('app').style.display = 'none';
+      document.getElementById('nav').style.display = 'none';
+      document.getElementById('logoAuth').src = 'logo.png';
+      document.getElementById('logoApp').src = 'logo.png';
+    });
+
+    onAuthStateChanged(auth, async (user) => {
+      currentUser = user;
+      if (user) {
+        if (!user.emailVerified) {
+          await sendEmailVerification(user);
+          alert("Please verify your email!");
+        }
+        document.getElementById('authContainer').style.display = 'none';
+        document.getElementById('app').style.display = 'block';
+        document.getElementById('nav').style.display = 'flex';
+        document.getElementById('profilePreview').style.display = 'flex';
+        loadProfilePreview(user);
+        showView('feedView');
+        await loadFollowing();
+        loadInitialFeed();
+        loadStories();
+        loadCommunity();
+        loadChatList();
+        loadNotifications();
+        await updateUserOnline(true);
+      } else {
+        document.getElementById('authContainer').style.display = 'block';
+        document.getElementById('app').style.display = 'none';
+        document.getElementById('nav').style.display = 'none';
+        document.getElementById('profilePreview').style.display = 'none';
+        if (feedUnsub) feedUnsub();
+        Object.values(commentUnsub).forEach(unsub => unsub && unsub());
+        if (chatListUnsub) chatListUnsub();
+        if (activeChatUnsub) activeChatUnsub();
+        if (notificationUnsub) notificationUnsub();
+        commentUnsub = {};
+        lastPostDoc = null;
+        await updateUserOnline(false);
+      }
+    });
+
+    // === ONLINE STATUS ===
+    async function updateUserOnline(online) {
+      if (!currentUser) return;
+      const userRef = doc(db, 'users', currentUser.uid);
+      await setDoc(userRef, {
+        online: online,
+        lastSeen: serverTimestamp()
+      }, { merge: true });
+    }
+
+    window.addEventListener('beforeunload', () => updateUserOnline(false));
+    window.addEventListener('unload', () => updateUserOnline(false));
+
+    // === NOTIFICATIONS ===
+    async function loadNotifications() {
+      if (notificationUnsub) notificationUnsub();
+      const q = query(collection(db, 'notifications'), where('to', '==', currentUser.uid), orderBy('createdAt', 'desc'), limit(10));
+      notificationUnsub = onSnapshot(q, (snap) => {
+        const count = snap.docs.filter(d => !d.data().read).length;
+        const badge = document.getElementById('notificationBadge');
+        badge.style.display = count > 0 ? 'inline' : 'none';
+        badge.textContent = count > 99 ? '99+' : count;
+      });
+    }
+
+    async function loadFollowing() {
+      const snap = await getDoc(doc(db, 'users', currentUser.uid));
+      followingCache = snap.data()?.following || [];
+    }
+
+    async function loadProfilePreview(user) {
+      const snap = await getDoc(doc(db, 'users', user.uid));
+      const u = snap.data();
+      const pic = u.profilePicUrl || 'https://via.placeholder.com/40';
+      const name = u.name || 'User';
+      document.getElementById('profilePic').src = pic;
+      document.getElementById('profileName').textContent = name;
+      document.getElementById('profilePreview').onclick = () => {
+        showView('profileView');
+        loadProfile(user.uid);
+      };
+    }
+
+    // === FEED ===
+    async function loadInitialFeed() {
+      if (feedUnsub) feedUnsub();
+      document.getElementById('postsList').innerHTML = '';
+      lastPostDoc = null;
+
+      const q = query(collection(db, 'posts'), orderBy('createdAt', 'desc'));
+      feedUnsub = onSnapshot(q, async (snap) => {
+        const postsHTML = await Promise.all(snap.docs.map(d => renderPost(d, true)));
+        document.getElementById('postsList').innerHTML = postsHTML.join('');
+      });
+    }
+
+    async function renderPost(d, makeProfileClickable = false) {
+      const p = d.data();
+      const authorSnap = await getDoc(doc(db, 'users', p.authorId));
+      const author = authorSnap.data();
+      const profilePic = author?.profilePicUrl || 'https://via.placeholder.com/40';
+      const reactions = p.reactions || {};
+      const myReaction = reactions[currentUser?.uid] || null;
+
+      const reactionCounts = {};
+      Object.values(reactions).forEach(r => {
+        reactionCounts[r] = (reactionCounts[r] || 0) + 1;
+      });
+
+      const isOwner = currentUser?.uid === p.authorId;
+      const profileLink = makeProfileClickable
+        ? `onclick="showView('profileView'); loadProfile('${p.authorId}');"`
+        : '';
+
+      const taggedText = p.text ? p.text.replace(/@([\w]+)/g, (match, username) => {
+        return `<span class="tag" onclick="goToProfileByUsername('${username}')">${match}</span>`;
+      }) : '';
+
+      const reactionSummaryHTML = Object.entries(reactionCounts).map(([emo, count]) => `
+        <span class="reaction-summary-item">
+          ${reactionEmojis[emo]} <span class="count">${count}</span>
+        </span>
+      `).join(' ');
+
+      return `
+        <div class="post" data-id="${d.id}">
+          <div class="post-header" style="cursor: ${makeProfileClickable ? 'pointer' : 'default'};" ${profileLink}>
+            <img src="${profilePic}" class="post-avatar" alt="${author?.name}">
+            <div>
+              <strong>${author?.name || 'User'} ${author?.surname || ''}</strong><br>
+              <small>@${p.username || 'user'}</small>
+            </div>
+          </div>
+
+          <div class="post-content">
+            ${taggedText ? `<p>${taggedText}</p>` : ''}
+            ${p.imageUrl ? `<img src="${p.imageUrl}" class="post-image">` : ''}
+          </div>
+
+          <div class="reaction-container">
+            <button class="react-main-btn ${myReaction ? 'active' : ''}" 
+                    onmouseenter="showReactionPopup(event)" 
+                    onmouseleave="hideReactionPopup(event)"
+                    onclick="toggleReactionPopup(event)">
+              ${myReaction ? reactionEmojis[myReaction] : 'React'}
+            </button>
+            <div class="reaction-popup" style="display:none;">
+              ${['Like','Love','Haha','Angry','Disagree','Congrats','Support'].map(r => `
+                <button class="react-option ${myReaction===r?'active':''}"
+                        onclick="reactToPost('${d.id}','${r}',this)"
+                        title="${r}">
+                  ${reactionEmojis[r]}
+                </button>
+              `).join('')}
+            </div>
+          </div>
+
+          ${Object.keys(reactionCounts).length > 0 ? `
+            <div class="reaction-summary">
+              ${reactionSummaryHTML}
+            </div>
+          ` : ''}
+
+          <button class="comment-toggle" onclick="toggleComments('${d.id}')">Comment</button>
+
+          ${isOwner ? `
+            <div class="post-footer">
+              <button class="delete-btn-compact" onclick="deletePost('${d.id}')">Delete</button>
+            </div>
+          ` : ''}
+
+          <div id="comments-${d.id}" class="comments-section" style="display:none;">
+            <div id="comment-list-${d.id}"></div>
+            <div class="comment-input">
+              <input type="text" id="comment-input-${d.id}" placeholder="Write a comment..." />
+              <button onclick="addComment('${d.id}')">Send</button>
+            </div>
+          </div>
+        </div>`;
+    }
+
+    async function renderComment(d, postId, depth = 0) {
+      const c = d.data();
+      const userSnap = await getDoc(doc(db, 'users', c.authorId));
+      const user = userSnap.data();
+      const reactions = c.reactions || {};
+      const myReaction = reactions[currentUser?.uid] || null;
+
+      const reactionCounts = {};
+      Object.values(reactions).forEach(r => {
+        reactionCounts[r] = (reactionCounts[r] || 0) + 1;
+      });
+
+      const reactionSummaryHTML = Object.entries(reactionCounts).map(([emo, count]) => `
+        <span class="reaction-summary-item">
+          ${reactionEmojis[emo]} <span class="count">${count}</span>
+        </span>
+      `).join(' ');
+
+      const replyQuery = query(collection(db, 'posts', postId, 'comments'), where('parentId', '==', d.id), orderBy('createdAt', 'asc'));
+      const replySnap = await getDocs(replyQuery);
+      const hasReplies = !replySnap.empty;
+      const showRepliesInitially = replySnap.size <= 2;
+
+      const repliesHTML = await Promise.all(replySnap.docs.slice(0, showRepliesInitially ? replySnap.size : 2).map(rd => renderComment(rd, postId, depth + 1)));
+      const hiddenCount = replySnap.size - 2;
+
+      return `
+        <div class="comment" data-id="${d.id}" style="margin-left:${depth * 20}px; border-left:${depth > 0 ? '2px solid #ddd' : 'none'}; padding-left:${depth > 0 ? '12px' : '0'};">
+          <div class="comment-header">
+            <strong>${user?.name || 'User'}</strong> <small>@${user?.username || 'user'}</small>
+          </div>
+          <p>${c.text}</p>
+
+          <div class="reaction-container comment-reaction">
+            <button class="react-main-btn ${myReaction ? 'active' : ''}" 
+                    onmouseenter="showReactionPopup(event)" 
+                    onmouseleave="hideReactionPopup(event)"
+                    onclick="toggleReactionPopup(event)">
+              ${myReaction ? reactionEmojis[myReaction] : 'React'}
+            </button>
+            <div class="reaction-popup" style="display:none;">
+              ${['Like','Love','Haha','Angry','Disagree','Congrats','Support'].map(r => `
+                <button class="react-option ${myReaction===r?'active':''}"
+                        onclick="reactToComment('${postId}','${d.id}','${r}',this)"
+                        title="${r}">
+                  ${reactionEmojis[r]}
+                </button>
+              `).join('')}
+            </div>
+          </div>
+
+          ${Object.keys(reactionCounts).length > 0 ? `
+            <div class="reaction-summary comment-summary">
+              ${reactionSummaryHTML}
+            </div>
+          ` : ''}
+
+          <button class="reply-btn" onclick="showReplyInput('${postId}', '${d.id}')">Reply</button>
+
+          <div id="replies-${d.id}" style="margin-top:8px;">
+            ${repliesHTML.join('')}
+            ${hasReplies && hiddenCount > 0 ? `<div class="show-more-replies" onclick="loadAllReplies('${postId}', '${d.id}')">Show ${hiddenCount} more...</div>` : ''}
+          </div>
+
+          <div id="reply-input-${d.id}" style="display:none; margin-top:8px; display:flex; gap:8px;">
+            <input type="text" placeholder="Reply..." class="reply-input-text" />
+            <button onclick="addReply('${postId}', '${d.id}')">Send</button>
+          </div>
+        </div>`;
+    }
+
+    window.loadAllReplies = async (postId, parentId) => {
+      const q = query(collection(db, 'posts', postId, 'comments'), where('parentId', '==', parentId), orderBy('createdAt', 'asc'));
+      const snap = await getDocs(q);
+      const repliesHTML = await Promise.all(snap.docs.map(d => renderComment(d, postId, 1)));
+      document.getElementById(`replies-${parentId}`).innerHTML = repliesHTML.join('');
+    };
+
+    window.showReplyInput = (postId, parentId) => {
+      const inputDiv = document.getElementById(`reply-input-${parentId}`);
+      inputDiv.style.display = 'flex';
+      inputDiv.querySelector('.reply-input-text').focus();
+    };
+
+    window.addReply = async (postId, parentId) => {
+      const input = document.querySelector(`#reply-input-${parentId} .reply-input-text`);
+      const text = input.value.trim();
+      if (!text) return;
+      await addDoc(collection(db, 'posts', postId, 'comments'), {
+        text, authorId: currentUser.uid, createdAt: serverTimestamp(), reactions: {}, parentId
+      });
+      input.value = '';
+      document.getElementById(`reply-input-${parentId}`).style.display = 'none';
+    };
+
+    // === REACTION POPUP ===
+    let activePopup = null;
+    window.showReactionPopup = (e) => {
+      if (window.innerWidth <= 600) return;
+      const popup = e.target.nextElementSibling;
+      popup.style.display = 'flex';
+      activePopup = popup;
+    };
+
+    window.hideReactionPopup = (e) => {
+      if (window.innerWidth <= 600) return;
+      const popup = e.target.nextElementSibling;
+      setTimeout(() => { if (activePopup === popup) popup.style.display = 'none'; }, 100);
+    };
+
+    window.toggleReactionPopup = (e) => {
+      if (window.innerWidth > 600) return;
+      const popup = e.target.nextElementSibling;
+      const isOpen = popup.style.display === 'flex';
+      document.querySelectorAll('.reaction-popup').forEach(p => p.style.display = 'none');
+      if (!isOpen) popup.style.display = 'flex';
+      e.stopPropagation();
+    };
+
+    document.addEventListener('click', () => {
+      document.querySelectorAll('.reaction-popup').forEach(p => p.style.display = 'none');
+    });
+
+    window.reactToPost = async (postId, reaction, btn) => {
+      const postRef = doc(db, 'posts', postId);
+      const snap = await getDoc(postRef);
+      const reactions = snap.data().reactions || {};
+      const current = reactions[currentUser.uid];
+
+      if (current === reaction) {
+        await updateDoc(postRef, { [`reactions.${currentUser.uid}`]: deleteField() });
+      } else {
+        const updateObj = { [`reactions.${currentUser.uid}`]: reaction };
+        if (current) updateObj[`reactions.${currentUser.uid}`] = deleteField();
+        await updateDoc(postRef, updateObj);
+      }
+
+      btn.closest('.reaction-popup').style.display = 'none';
+    };
+
+    window.reactToComment = async (postId, commentId, reaction, btn) => {
+      const commentRef = doc(db, 'posts', postId, 'comments', commentId);
+      const snap = await getDoc(commentRef);
+      const reactions = snap.data().reactions || {};
+      const current = reactions[currentUser.uid];
+
+      if (current === reaction) {
+        await updateDoc(commentRef, { [`reactions.${currentUser.uid}`]: deleteField() });
+      } else {
+        const updateObj = { [`reactions.${currentUser.uid}`]: reaction };
+        if (current) updateObj[`reactions.${currentUser.uid}`] = deleteField();
+        await updateDoc(commentRef, updateObj);
+      }
+
+      btn.closest('.reaction-popup').style.display = 'none';
+    };
+
+    window.deletePost = async (postId) => {
+      if (!confirm("Delete this post?")) return;
+      await deleteDoc(doc(db, 'posts', postId));
+    };
+
+    window.toggleComments = (postId) => {
+      const section = document.getElementById(`comments-${postId}`);
+      section.style.display = section.style.display === 'block' ? 'none' : 'block';
+      if (section.style.display === 'block' && !commentUnsub[postId]) {
+        loadComments(postId);
+      }
+    };
+
+    async function loadComments(postId) {
+      if (commentUnsub[postId]) return;
+      const q = query(collection(db, 'posts', postId, 'comments'), where('parentId', '==', null), orderBy('createdAt', 'asc'));
+      commentUnsub[postId] = onSnapshot(q, async (snap) => {
+        const commentsHTML = await Promise.all(snap.docs.map(d => renderComment(d, postId)));
+        document.getElementById(`comment-list-${postId}`).innerHTML = commentsHTML.join('') || '<p style="color:#aaa; font-size:14px;">No comments yet</p>';
+      });
+    }
+
+    window.addComment = async (postId) => {
+      const input = document.getElementById(`comment-input-${postId}`);
+      const text = input.value.trim();
+      if (!text) return;
+      await addDoc(collection(db, 'posts', postId, 'comments'), {
+        text, authorId: currentUser.uid, createdAt: serverTimestamp(), reactions: {}, parentId: null
+      });
+      input.value = '';
+    };
+
+    window.goToProfileByUsername = async (username) => {
+      const q = query(collection(db, 'users'), where('username', '==', username));
+      const snap = await getDocs(q);
+      if (snap.empty) return alert("User not found");
+      const uid = snap.docs[0].id;
+      showView('profileView');
+      loadProfile(uid);
+    };
+
+    document.getElementById('postBtn').onclick = async () => {
+      const text = document.getElementById('postText').value.trim();
+      const file = document.getElementById('postImage').files[0];
+      if (!text && !file) return;
+
+      const mentions = [...new Set(text.match(/@[\w]+/g) || [])].map(m => m.slice(1));
+      let imageUrl = '';
+      if (file) {
+        const imgRef = ref(storage, `posts/${currentUser.uid}/${Date.now()}_${file.name}`);
+        await uploadBytes(imgRef, file);
+        imageUrl = await getDownloadURL(imgRef);
+      }
+
+      const userSnap = await getDoc(doc(db, 'users', currentUser.uid));
+      const userData = userSnap.data();
+
+      await addDoc(collection(db, 'posts'), {
+        text, imageUrl, authorId: currentUser.uid, username: userData.username,
+        mentions, reactions: {}, createdAt: serverTimestamp()
+      });
+
+      document.getElementById('postText').value = '';
+      document.getElementById('postImage').value = '';
+    };
+
+    // === @TAG AUTOCOMPLETE ===
+    const postText = document.getElementById('postText');
+    const tagSuggestions = document.getElementById('tagSuggestions');
+    postText.addEventListener('input', async () => {
+      const val = postText.value;
+      const atIndex = val.lastIndexOf('@');
+      if (atIndex === -1 || !currentUser) {
+        tagSuggestions.style.display = 'none';
+        return;
+      }
+      const queryStr = val.slice(atIndex + 1).toLowerCase();
+      if (queryStr.length === 0) { tagSuggestions.style.display = 'none'; return; }
+      const matches = await Promise.all(
+        followingCache.map(async uid => {
+          const snap = await getDoc(doc(db, 'users', uid));
+          const data = snap.data();
+          return data.username?.toLowerCase().includes(queryStr) ? { uid, username: data.username } : null;
+        })
+      ).then(arr => arr.filter(Boolean));
+      if (matches.length === 0) { tagSuggestions.style.display = 'none'; return; }
+      tagSuggestions.innerHTML = matches.map(u => `
+        <div style="padding:10px; cursor:pointer; border-bottom:1px solid #eee;" 
+             onclick="selectTag('${u.username}')">
+          @${u.username}
+        </div>
+      `).join('');
+      tagSuggestions.style.display = 'block';
+    });
+
+    window.selectTag = (username) => {
+      const val = postText.value;
+      const atIndex = val.lastIndexOf('@');
+      postText.value = val.slice(0, atIndex) + `@${username} `;
+      tagSuggestions.style.display = 'none';
+      postText.focus();
+    };
+
+    document.addEventListener('click', (e) => {
+      if (!postText.contains(e.target) && !tagSuggestions.contains(e.target)) {
+        tagSuggestions.style.display = 'none';
+      }
+    });
+
+    // === CHAT LIST ===
+    async function loadChatList() {
+      if (chatListUnsub) chatListUnsub();
+      const chatsRef = collection(db, 'chats');
+      const q = query(chatsRef, where('participants', 'array-contains', currentUser.uid));
+      chatListUnsub = onSnapshot(q, async (snap) => {
+        const chatsHTML = await Promise.all(snap.docs.map(async (d) => {
+          const data = d.data();
+          const otherId = data.participants.find(id => id !== currentUser.uid);
+          const userSnap = await getDoc(doc(db, 'users', otherId));
+          const user = userSnap.data();
+          const pic = user?.profilePicUrl || 'https://via.placeholder.com/40';
+          const name = user?.name || 'User';
+          const lastMsg = data.lastMessage || {};
+          const time = lastMsg.sentAt ? new Date(lastMsg.sentAt.toDate()).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : '';
+          const unread = data.unread?.[currentUser.uid] || 0;
+          const online = user?.online || false;
+          return `
+            <div class="chat-item" onclick="openChat('${otherId}', '${name}', '${d.id}')">
+              <div class="chat-avatar">
+                <img src="${pic}" alt="${name}">
+                <span class="online-dot" style="background:${online?'#4ade80':'#9ca3af'};"></span>
+              </div>
+              <div class="chat-info">
+                <strong>${name}</strong>
+                <small>${lastMsg.text ? (lastMsg.text.length > 30 ? lastMsg.text.slice(0,30)+'...' : lastMsg.text) : 'No messages'}</small>
+              </div>
+              <div class="chat-meta">
+                <small>${time}</small>
+                ${unread > 0 ? `<span class="unread-badge">${unread > 99 ? '99+' : unread}</span>` : ''}
+              </div>
+            </div>`;
+        }));
+        document.getElementById('chatList').innerHTML = chatsHTML.join('') || '<p style="color:#666; text-align:center;">No chats yet</p>';
+      });
+    }
+
+    // === AUTO RESIZE TEXTAREA (IMPROVED) ===
+    function autoResize(textarea) {
+      textarea.style.height = 'auto';
+      textarea.style.height = Math.min(textarea.scrollHeight, 140) + 'px';
+    }
+
+    // === OPEN CHAT WITH EMOJI + VOICE ===
+    window.openChat = async (otherId, otherName, chatId) => {
+      activeChatId = chatId;
+      document.getElementById('chatWith').textContent = otherName;
+      document.getElementById('chatHeader').innerHTML = `
+        <button onclick="showView('chatListView')" style="background:none; border:none; color:#fff; font-size:20px; cursor:pointer;">Back</button>
+        <strong>${otherName}</strong>
+      `;
+      showView('chatThreadView');
+      if (activeChatUnsub) activeChatUnsub();
+
+      await updateDoc(doc(db, 'chats', chatId), {
+        [`unread.${currentUser.uid}`]: 0
+      });
+
+      const msgRef = collection(db, 'chats', chatId, 'messages');
+      const q = query(msgRef, orderBy('sentAt'));
+      activeChatUnsub = onSnapshot(q, async (snap) => {
+        const messagesHTML = await Promise.all(snap.docs.map(d => renderMessage(d)));
+        document.getElementById('messagesContainer').innerHTML = messagesHTML.join('');
+        scrollToBottom();
+
+        if (seenObserver) seenObserver.disconnect();
+        seenObserver = new IntersectionObserver((entries) => {
+          entries.forEach(async (entry) => {
+            if (entry.isIntersecting) {
+              const msgId = entry.target.dataset.id;
+              const msgSnap = await getDoc(doc(db, 'chats', chatId, 'messages', msgId));
+              const data = msgSnap.data();
+              if (data.sender !== currentUser.uid && !data.seenBy?.some(s => s.uid === currentUser.uid)) {
+                await updateDoc(doc(db, 'chats', chatId, 'messages', msgId), {
+                  seenBy: arrayUnion({ uid: currentUser.uid, at: serverTimestamp() })
+                });
+              }
+            }
+          });
+        }, { threshold: 0.7 });
+
+        document.querySelectorAll('.message').forEach(msgEl => {
+          seenObserver.observe(msgEl);
+        });
+      });
+
+      const typingRef = doc(db, 'chats', chatId);
+      const typingListener = onSnapshot(typingRef, (doc) => {
+        const data = doc.data();
+        const typingUsers = Object.keys(data?.typing || {}).filter(id => id !== currentUser.uid && data.typing[id]);
+        const typingEl = document.getElementById('typingIndicator');
+        typingEl.textContent = typingUsers.length > 0 ? `${typingUsers.length} typing...` : '';
+        typingEl.style.display = typingUsers.length > 0 ? 'block' : 'none';
+      });
+
+      window.handleTyping = () => {
+        clearTimeout(typingTimeout);
+        setDoc(doc(db, 'chats', chatId), { [`typing.${currentUser.uid}`]: true }, { merge: true });
+        typingTimeout = setTimeout(() => {
+          setDoc(doc(db, 'chats', chatId), { [`typing.${currentUser.uid}`]: deleteField() }, { merge: true });
+        }, 1000);
+      };
+
+      // === EMOJI PICKER ===
+      const emojiBtn = document.getElementById('emojiBtn');
+      const emojiPicker = document.getElementById('emojiPicker');
+      emojiBtn.onclick = () => {
+        emojiPicker.style.display = emojiPicker.style.display === 'block' ? 'none' : 'block';
+      };
+
+      // Build emoji tabs
+      let tabsHTML = '';
+      let contentHTML = '';
+      Object.entries(emojiCategories).forEach(([cat, emojis]) => {
+        tabsHTML += `<button class="emoji-tab" onclick="showEmojiTab('${cat}')">${cat}</button>`;
+        contentHTML += `<div id="emoji-${cat}" class="emoji-tab-content" style="display:none;">`;
+        emojis.forEach(e => {
+          contentHTML += `<span class="emoji" onclick="insertEmoji('${e}')">${e}</span>`;
+        });
+        contentHTML += `</div>`;
+      });
+      document.getElementById('emojiTabs').innerHTML = tabsHTML;
+      document.getElementById('emojiContent').innerHTML = contentHTML;
+      showEmojiTab(Object.keys(emojiCategories)[0]);
+
+      // === VOICE RECORDING ===
+      const voiceBtn = document.getElementById('voiceBtn');
+      const voiceStatus = document.getElementById('voiceStatus');
+      let isRecording = false;
+
+      voiceBtn.onmousedown = async () => {
+        if (isRecording) return;
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          mediaRecorder = new MediaRecorder(stream);
+          audioChunks = [];
+
+          mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+          mediaRecorder.onstop = async () => {
+            const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+            const audioRef = ref(storage, `chats/${chatId}/voice_${Date.now()}.webm`);
+            const uploadTask = uploadBytesResumable(audioRef, audioBlob);
+
+            uploadTask.on('state_changed',
+              () => {},
+              () => alert("Upload failed"),
+              async () => {
+                const url = await getDownloadURL(uploadTask.snapshot.ref);
+                await sendMessage(url, 'audio');
+              }
+            );
+            stream.getTracks().forEach(t => t.stop());
+          };
+
+          mediaRecorder.start();
+          isRecording = true;
+          voiceBtn.style.background = '#dc3545';
+          voiceStatus.textContent = 'Recording...';
+          voiceStatus.style.display = 'block';
+        } catch (e) {
+          alert("Microphone access denied");
+        }
+      };
+
+      voiceBtn.onmouseup = () => {
+        if (mediaRecorder && isRecording) {
+          mediaRecorder.stop();
+          isRecording = false;
+          voiceBtn.style.background = '#6c757d';
+          voiceStatus.style.display = 'none';
+        }
+      };
+
+      // MEDIA UPLOAD
+      document.getElementById('sendMedia').onclick = async () => {
+        const file = document.getElementById('chatMedia').files[0];
+        if (!file) return;
+
+        if (file.size > 10 * 1024 * 1024) {
+          alert("File too large. Max 10MB.");
+          return;
+        }
+
+        const type = file.type.startsWith('image/') ? 'image' :
+                     file.type.startsWith('video/') ? 'video' : null;
+
+        if (!type) {
+          alert("Unsupported file type.");
+          return;
+        }
+
+        const mediaRef = ref(storage, `chats/${chatId}/${Date.now()}_${file.name}`);
+        const uploadTask = uploadBytesResumable(mediaRef, file);
+
+        const progressEl = document.createElement('div');
+        progressEl.className = 'upload-progress';
+        progressEl.innerHTML = '<div class="upload-progress-bar"></div>';
+        const sendBtn = document.querySelector('#chatThreadView button[onclick*="sendMessage"]');
+        sendBtn.parentNode.appendChild(progressEl);
+
+        uploadTask.on('state_changed',
+          (snapshot) => {
+            const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+            progressEl.querySelector('.upload-progress-bar').style.width = progress + '%';
+          },
+          (error) => {
+            alert("Upload failed: " + error.message);
+            progressEl.remove();
+          },
+          async () => {
+            const mediaUrl = await getDownloadURL(uploadTask.snapshot.ref);
+            await sendMessage(mediaUrl, type);
+            document.getElementById('chatMedia').value = '';
+            progressEl.remove();
+          }
+        );
+      };
+
+      document.getElementById('chatMedia').onchange = () => {
+        if (document.getElementById('chatMedia').files[0]) {
+          document.getElementById('sendMedia').style.display = 'inline-block';
+        }
+      };
+    };
+
+    window.showEmojiTab = (cat) => {
+      document.querySelectorAll('.emoji-tab').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.emoji-tab-content').forEach(c => c.style.display = 'none');
+      document.querySelector(`[onclick="showEmojiTab('${cat}')"]`).classList.add('active');
+      document.getElementById(`emoji-${cat}`).style.display = 'grid';
+    };
+
+    window.insertEmoji = (emoji) => {
+      const input = document.getElementById('msgInput');
+      input.value += emoji;
+      input.focus();
+      document.getElementById('emojiPicker').style.display = 'none';
+    };
+
+    function scrollToBottom() {
+      const container = document.getElementById('messagesContainer');
+      container.scrollTop = container.scrollHeight;
+    }
+
+    // === RENDER MESSAGE WITH MEDIA ===
+    async function renderMessage(d, depth = 0) {
+      const m = d.data();
+      const userSnap = await getDoc(doc(db, 'users', m.sender));
+      const user = userSnap.data();
+      const isMe = m.sender === currentUser.uid;
+      const time = m.sentAt ? new Date(m.sentAt.toDate()).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : '';
+
+      const mySeen = m.seenBy?.find(s => s.uid === currentUser.uid);
+      const seenTime = mySeen?.at ? new Date(mySeen.at.toDate()).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : null;
+
+      const replyHTML = m.replyTo ? await renderReplyPreview(m.replyTo) : '';
+
+      let mediaHTML = '';
+      if (m.type === 'image') {
+        mediaHTML = `<img src="${m.mediaUrl}" class="chat-image" onclick="openMedia('${m.mediaUrl}', 'image')">`;
+      } else if (m.type === 'video') {
+        mediaHTML = `<video src="${m.mediaUrl}" class="chat-video" controls onclick="this.play()"></video>`;
+      } else if (m.type === 'audio') {
+        mediaHTML = `
+          <div class="chat-audio">
+            <audio src="${m.mediaUrl}" controls></audio>
+          </div>`;
+      }
+
+      const statusHTML = isMe ? `
+        <div class="message-status">
+          ${seenTime ? `Seen at ${seenTime}` : 'Delivered'}
+        </div>
+      ` : '';
+
+      return `
+        <div class="message ${isMe ? 'sent' : 'received'}" data-id="${d.id}" style="margin-left:${depth * 30}px;">
+          ${replyHTML}
+          <div class="message-content">
+            ${m.text ? `<p>${m.text}</p>` : ''}
+            ${mediaHTML}
+            <small class="message-time">${time}</small>
+            ${statusHTML}
+          </div>
+          ${!isMe ? `<button class="reply-btn" onclick="setReplyTo('${d.id}', '${m.text || m.type}', '${user.name}')">Reply</button>` : ''}
+        </div>`;
+    }
+
+    async function renderReplyPreview(replyId) {
+      const snap = await getDoc(doc(db, 'chats', activeChatId, 'messages', replyId));
+      if (!snap.exists()) return '';
+      const r = snap.data();
+      return `<div class="reply-preview">Replying to: ${r.text ? r.text.slice(0,30) + (r.text.length > 30 ? '...' : '') : r.type}</div>`;
+    }
+
+    window.setReplyTo = (msgId, text, authorName) => {
+      replyToMessage = { id: msgId, text, author: authorName };
+      const preview = document.getElementById('replyPreview');
+      preview.innerHTML = `Replying to ${authorName}: ${text.slice(0,30)}${text.length > 30 ? '...' : ''} <span onclick="clearReply()" style="cursor:pointer; color:#999;">×</span>`;
+      preview.style.display = 'block';
+    };
+
+    window.clearReply = () => {
+      replyToMessage = null;
+      document.getElementById('replyPreview').style.display = 'none';
+    };
+
+    // === SEND MESSAGE WITH MEDIA ===
+    window.sendMessage = async (content, type = 'text') => {
+      if (!content.trim() && type === 'text') return;
+      const msgRef = collection(db, 'chats', activeChatId, 'messages');
+      const msgData = {
+        text: type === 'text' ? content : '',
+        mediaUrl: type !== 'text' ? content : '',
+        type,
+        sender: currentUser.uid,
+        sentAt: serverTimestamp(),
+        seenBy: [{ uid: currentUser.uid, at: serverTimestamp() }],
+        replyTo: replyToMessage?.id || null
+      };
+      const msgDoc = await addDoc(msgRef, msgData);
+
+      const otherId = activeChatId.split('_').find(id => id !== currentUser.uid);
+      await updateDoc(doc(db, 'chats', activeChatId), {
+        lastMessage: { text: type === 'text' ? content : (type === 'image' ? 'Photo' : type === 'video' ? 'Video' : 'Audio'), sentAt: serverTimestamp() },
+        [`unread.${otherId}`]: increment(1)
+      });
+
+      await addDoc(collection(db, 'notifications'), {
+        to: otherId,
+        from: currentUser.uid,
+        type: 'message',
+        text: type === 'text' ? content : `Sent a ${type}`,
+        chatId: activeChatId,
+        createdAt: serverTimestamp(),
+        read: false
+      });
+
+      document.getElementById('msgInput').value = '';
+      clearReply();
+    };
+
+    // === FULLSCREEN MEDIA VIEWER ===
+    window.openMedia = (url, type) => {
+      const viewer = document.createElement('div');
+      viewer.style.cssText = `
+        position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.95);
+        display:flex; justify-content:center; align-items:center; z-index:10000; flex-direction:column;
+      `;
+      if (type === 'image') {
+        viewer.innerHTML = `<img src="${url}" style="max-width:90%; max-height:80%; border-radius:12px;">`;
+      } else if (type === 'video') {
+        viewer.innerHTML = `<video src="${url}" controls autoplay style="max-width:90%; max-height:80%; border-radius:12px;"></video>`;
+      }
+      viewer.innerHTML += `<button onclick="this.parentNode.remove()" style="margin-top:20px; padding:10px 20px; background:#dc3545; color:white; border:none; border-radius:50px;">Close</button>`;
+      document.body.appendChild(viewer);
+    };
+
+    // === STORIES, COMMUNITY, PROFILE, AUTH ===
+    async function loadStories() {
+      const storiesDiv = document.getElementById('storiesList');
+      const snap = await getDocs(query(collection(db, 'stories'), where('expiresAt', '>', serverTimestamp())));
+      const storiesHTML = await Promise.all(snap.docs.map(async (d) => {
+        const s = d.data();
+        const userSnap = await getDoc(doc(db, 'users', s.userId));
+        const user = userSnap.data();
+        return `<div class="story" onclick="viewStory('${s.imageUrl}')">
+          <img src="${user?.profilePicUrl || 'https://via.placeholder.com/60'}" class="story-avatar">
+          <div class="story-name">${user?.name || 'User'}</div>
+        </div>`;
+      }));
+      storiesDiv.innerHTML = storiesHTML.join('');
+    }
+
+    window.viewStory = (url) => {
+      document.getElementById('storyImage').src = url;
+      document.getElementById('storyView').style.display = 'flex';
+    };
+
+    document.getElementById('closeStory').onclick = () => {
+      document.getElementById('storyView').style.display = 'none';
+    };
+
+    document.getElementById('addStoryBtn').onclick = async () => {
+      const file = document.getElementById('storyImage').files[0];
+      if (!file) return;
+      const refStory = ref(storage, `stories/${currentUser.uid}/${Date.now()}`);
+      await uploadBytes(refStory, file);
+      const url = await getDownloadURL(refStory);
+      await addDoc(collection(db, 'stories'), {
+        userId: currentUser.uid,
+        imageUrl: url,
+        createdAt: serverTimestamp(),
+        expiresAt: Timestamp.fromDate(new Date(Date.now() + 24*60*60*1000))
+      });
+      document.getElementById('storyImage').value = '';
+      loadStories();
+    };
+
+    async function loadCommunity() {
+      const q = query(collection(db, 'users'), orderBy('name'));
+      const snap = await getDocs(q);
+      const html = await Promise.all(snap.docs.map(async (d) => {
+        const u = d.data();
+        const isFollowing = followingCache.includes(d.id);
+        return `<div class="user-card">
+          <img src="${u.profilePicUrl || 'https://via.placeholder.com/60'}" class="user-avatar">
+          <div><strong>${u.name} ${u.surname}</strong><br><small>${u.residence}</small></div>
+          <button onclick="toggleFollow('${d.id}', this)">${isFollowing ? 'Unfollow' : 'Follow'}</button>
+        </div>`;
+      }));
+      document.getElementById('communityList').innerHTML = html.join('');
+    }
+
+    window.toggleFollow = async (uid, btn) => {
+      const userRef = doc(db, 'users', currentUser.uid);
+      if (followingCache.includes(uid)) {
+        await updateDoc(userRef, { following: arrayRemove(uid) });
+        followingCache = followingCache.filter(id => id !== uid);
+        btn.textContent = 'Follow';
+      } else {
+        await updateDoc(userRef, { following: arrayUnion(uid) });
+        followingCache.push(uid);
+        btn.textContent = 'Unfollow';
+      }
+    };
+
+    window.loadProfile = async (uid) => {
+      const snap = await getDoc(doc(db, 'users', uid));
+      const u = snap.data();
+      const isMe = uid === currentUser.uid;
+      const followBtn = !isMe && (followingCache.includes(uid) ? 'Unfollow' : 'Follow');
+      const age = u.dob ? new Date().getFullYear() - new Date(u.dob).getFullYear() : '';
+      document.getElementById('profileContent').innerHTML = `
+        <div style="text-align:center;">
+          <img src="${u.profilePicUrl || 'https://via.placeholder.com/120'}" style="width:120px;height:120px;border-radius:50%;border:4px solid #6c757d;">
+          <h3>${u.name} ${u.surname}</h3>
+          <p>@${u.username || 'user'} • ${u.residence || 'Nkomazi'}</p>
+          ${u.bio ? `<p><em>${u.bio}</em></p>` : ''}
+          <p>Age: ${u.exactAge ? age : 'Hidden'}</p>
+          ${!isMe ? `<button onclick="toggleFollow('${uid}', this)">${followBtn}</button>` : ''}
+          ${isMe ? `<button onclick="showView('editProfileView'); loadEditProfile()">Edit Profile</button>` : ''}
+        </div>
+        <hr>
+        <h4>Education</h4>
+        <p>${u.uni || '—'} • ${u.qual || ''} (${u.studyStart || ''} - ${u.studyEnd || ''})</p>
+        <h4>Work</h4>
+        <p>${u.occ || '—'}</p>
+        <h4>Status</h4>
+        <p>${u.marital || '—'}</p>
+      `;
+    };
+
+    window.loadEditProfile = async () => {
+      const snap = await getDoc(doc(db, 'users', currentUser.uid));
+      const u = snap.data();
+      document.getElementById('editName').value = u.name || '';
+      document.getElementById('editSurname').value = u.surname || '';
+      document.getElementById('editBio').value = u.bio || '';
+      document.getElementById('editResidence').value = u.residence || '';
+      document.getElementById('editUni').value = u.uni || '';
+      document.getElementById('editQual').value = u.qual || '';
+      document.getElementById('editStudyStart').value = u.studyStart || '';
+      document.getElementById('editStudyEnd').value = u.studyEnd || '';
+      document.getElementById('editOcc').value = u.occ || '';
+      document.getElementById('editMarital').value = u.marital || '';
+    };
+
+    document.getElementById('saveProfileBtn').onclick = async () => {
+      const updates = {
+        name: document.getElementById('editName').value,
+        surname: document.getElementById('editSurname').value,
+        bio: document.getElementById('editBio').value,
+        residence: document.getElementById('editResidence').value,
+        uni: document.getElementById('editUni').value,
+        qual: document.getElementById('editQual').value,
+        studyStart: document.getElementById('editStudyStart').value,
+        studyEnd: document.getElementById('editStudyEnd').value,
+        occ: document.getElementById('editOcc').value,
+        marital: document.getElementById('editMarital').value
+      };
+
+      const file = document.getElementById('editProfilePic').files[0];
+      if (file) {
+        const refPic = ref(storage, `profiles/${currentUser.uid}`);
+        await uploadBytes(refPic, file);
+        updates.profilePicUrl = await getDownloadURL(refPic);
+      }
+
+      await updateDoc(doc(db, 'users', currentUser.uid), updates);
+      showView('profileView');
+      loadProfile(currentUser.uid);
+    };
+
+    document.getElementById('searchBtnExec').onclick = async () => {
+      const q = document.getElementById('searchQuery').value.trim();
+      if (!q) return;
+      const users = await getDocs(query(collection(db, 'users'), where('name', '>=', q), where('name', '<=', q + '\uf8ff')));
+      const results = await Promise.all(users.docs.map(async (d) => {
+        const u = d.data();
+        return `<div class="user-card" onclick="showView('profileView'); loadProfile('${d.id}');">
+          <img src="${u.profilePicUrl || 'https://via.placeholder.com/60'}" class="user-avatar">
+          <div><strong>${u.name} ${u.surname}</strong><br><small>${u.residence}</small></div>
+        </div>`;
+      }));
+      document.getElementById('searchResults').innerHTML = results.join('') || '<p>No results</p>';
+    };
+
+    // === AUTH ===
+    document.getElementById('toRegister').onclick = (e) => { e.preventDefault(); document.getElementById('loginForm').style.display = 'none'; document.getElementById('registerForm').style.display = 'block'; };
+    document.getElementById('toLogin').onclick = (e) => { e.preventDefault(); document.getElementById('registerForm').style.display = 'none'; document.getElementById('loginForm').style.display = 'block'; };
+    document.getElementById('resetPassLink').onclick = (e) => { e.preventDefault(); document.getElementById('loginForm').style.display = 'none'; document.getElementById('resetForm').style.display = 'block'; };
+    document.getElementById('backToLogin').onclick = (e) => { e.preventDefault(); document.getElementById('resetForm').style.display = 'none'; document.getElementById('loginForm').style.display = 'block'; };
+
+    document.getElementById('registerBtn').onclick = async () => {
+      const name = document.getElementById('regName').value.trim();
+      const surname = document.getElementById('regSurname').value.trim();
+      const gender = document.getElementById('regGender').value;
+      const dob = document.getElementById('regDob').value;
+      const residence = document.getElementById('regResidence').value.trim();
+      const email = document.getElementById('regEmail').value.trim();
+      const phone = document.getElementById('regPhone').value.trim();
+      const pass = document.getElementById('regPass').value;
+      const passConfirm = document.getElementById('regPassConfirm').value;
+
+      if (pass !== passConfirm) return alert("Passwords don't match");
+      if (pass.length < 8) return alert("Password too short");
+
+      try {
+        const cred = await createUserWithEmailAndPassword(auth, email, pass);
+        let picUrl = '';
+        const file = document.getElementById('regProfilePic').files[0];
+        if (file) {
+          const refPic = ref(storage, `profiles/${cred.user.uid}`);
+          await uploadBytes(refPic, file);
+          picUrl = await getDownloadURL(refPic);
+        }
+
+        const username = `${name.toLowerCase()}${surname.toLowerCase()}${Date.now().toString().slice(-4)}`;
+
+        await setDoc(doc(db, 'users', cred.user.uid), {
+          name, surname, gender, dob, residence, email, phone,
+          username, profilePicUrl: picUrl,
+          uni: document.getElementById('regUni').value,
+          qual: document.getElementById('regQual').value,
+          studyStart: document.getElementById('regStudyStart').value,
+          studyEnd: document.getElementById('regStudyEnd').value,
+          occ: document.getElementById('regOcc').value,
+          marital: document.getElementById('regMarital').value,
+          exactAge: document.getElementById('regExactAge').checked,
+          following: [],
+          createdAt: serverTimestamp()
+        });
+
+        alert("Registered! Check your email.");
+      } catch (e) {
+        alert(e.message);
+      }
+    };
+
+    document.getElementById('loginBtn').onclick = async () => {
+      const id = document.getElementById('loginId').value.trim();
+      const pass = document.getElementById('loginPass').value;
+      let email = id;
+      if (!id.includes('@')) {
+        const snap = await getDocs(query(collection(db, 'users'), where('username', '==', id)));
+        if (snap.empty) return alert("User not found");
+        email = snap.docs[0].data().email;
+      }
+      try {
+        await signInWithEmailAndPassword(auth, email, pass);
+      } catch (e) {
+        alert(e.message);
+      }
+    };
+
+    document.getElementById('resetBtn').onclick = async () => {
+      const email = document.getElementById('resetEmail').value.trim();
+      if (!email) return alert("Enter email");
+      await sendPasswordResetEmail(auth, email);
+      alert("Reset link sent!");
+    };
+
+    document.getElementById('logoutBtn').onclick = () => signOut(auth);
+
+    // === NAVIGATION ===
+    document.getElementById('chatBtn').onclick = () => showView('chatListView');
+    document.getElementById('feedBtn').onclick = () => { showView('feedView'); loadInitialFeed(); };
+    document.getElementById('searchBtn').onclick = () => showView('searchView');
+    document.getElementById('profileBtn').onclick = () => { showView('profileView'); loadProfile(currentUser.uid); };
+    document.getElementById('storiesBtn').onclick = () => showView('storiesView');
+    document.getElementById('communityBtn').onclick = () => showView('communityView');
+    document.getElementById('logoApp').onclick = () => { showView('feedView'); loadInitialFeed(); };
+
+    function showView(id) {
+      document.querySelectorAll('#app > div').forEach(d => d.style.display = 'none');
+      document.getElementById(id).style.display = 'block';
+    }
+  </script>
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', sans-serif; background: #000 no-repeat center center fixed; background-size: cover; color: #fff; min-height: 100vh; transition: background-image 1.5s ease-in-out; }
+    .overlay { background: rgba(0, 0, 0, 0.4); min-height: 100vh; padding: 20px; }
+    .logo-container { text-align: center; margin: 30px 0; }
+    .logo-container img { height: 120px; border-radius: 12px; cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+    header {
+      background: rgba(248, 249, 250, 0.95); padding: 16px; display: flex; align-items: center;
+      justify-content: space-between; border-bottom: 1px solid #ddd; border-radius: 16px;
+      margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); flex-wrap: wrap;
+    }
+    #logoApp { height: 100px; margin-left: 20px; border-radius: 12px; cursor: pointer; }
+    nav { display: flex; gap: 10px; overflow-x: auto; white-space: nowrap; padding: 8px 0; }
+    nav button { background: #6c757d; color: white; border: none; padding: 10px 18px; border-radius: 30px; font-weight: bold; cursor: pointer; }
+    #chatBtn { background: #28a745; padding: 8px 12px; font-size: 14px; position: relative; }
+    #notificationBadge { background: #dc3545; color: white; border-radius: 50%; width: 18px; height: 18px; font-size: 10px; position: absolute; top: -5px; right: -5px; display: none; align-items: center; justify-content: center; }
+    #profilePreview { display: none; align-items: center; gap: 10px; cursor: pointer; background: white; padding: 8px 12px; border-radius: 40px; box-shadow: 0 3px 10px rgba(0,0,0,0.15); }
+    #profilePic { width: 44px; height: 44px; border-radius: 50%; border: 3px solid #6c757d; }
+
+    #authContainer, #app > div { 
+      margin: 30px auto; padding: 30px; background: rgba(255, 255, 255, 0.97); 
+      border-radius: 16px; color: #333; max-width: 900px; width: 100%;
+    }
+
+    input, select, textarea, button { width: 100%; padding: 14px; margin: 10px 0; border: 1px solid #ced4da; border-radius: 10px; font-size: 16px; }
+    button { background: #6c757d; color: white; border: none; cursor: pointer; font-weight: bold; }
+    .post, .user-card { background: rgba(255, 255, 255, 0.97); padding: 18px; border-radius: 16px; margin-bottom: 18px; box-shadow: 0 3px 12px rgba(0,0,0,0.1); }
+    .post-header { display: flex; align-items: center; gap: 14px; }
+    .post-avatar, .user-avatar { width: 48px; height: 48px; border-radius: 50%; border: 2px solid #ddd; }
+
+    .reaction-container { display: inline-block; margin: 8px 0; }
+    .react-main-btn {
+      background: #f1f3f5; color: #495057; border: 1px solid #ced4da;
+      padding: 6px 14px; border-radius: 20px; font-size: 14px; font-weight: 600;
+      cursor: pointer; min-width: 70px; display: flex; align-items: center; gap: 4px;
+    }
+    .react-main-btn.active { background: #6c757d; color: white; }
+
+    .reaction-popup {
+      position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%);
+      background: white; border: 1px solid #ddd; border-radius: 20px; padding: 6px;
+      display: flex; gap: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); z-index: 10; margin-bottom: 6px;
+    }
+    .react-option {
+      background: none; border: none; font-size: 22px; cursor: pointer;
+      padding: 4px; border-radius: 50%; transition: transform 0.2s;
+    }
+    .react-option:hover { transform: scale(1.4); }
+    .react-option.active { background: #e9ecef; }
+
+    .reaction-summary {
+      margin: 6px 0; display: flex; gap: 8px; flex-wrap: wrap; font-size: 14px;
+    }
+    .reaction-summary-item {
+      display: flex; align-items: center; gap: 4px; background: #f8f9fa; padding: 4px 8px; border-radius: 12px;
+    }
+    .reaction-summary .count { font-weight: bold; color: #495057; }
+
+    .comment-toggle { background: #e9ecef; color: #495057; border: 1px solid #ced4da; padding: 6px 12px; border-radius: 20px; font-size: 12px; margin-left: 8px; cursor: pointer; }
+    .post-footer { text-align: right; margin-top: 8px; }
+    .delete-btn-compact { background: #dc3545; color: white; border: none; padding: 4px 10px; border-radius: 12px; font-size: 11px; cursor: pointer; font-weight: 600; }
+
+    .comments-section { margin-top: 15px; border-top: 1px solid #eee; padding-top: 10px; }
+    .comment { background: #f8f9fa; padding: 12px; border-radius: 12px; margin-bottom: 12px; font-size: 14px; }
+    .comment-reaction .react-main-btn { font-size: 11px; padding: 4px 8px; min-width: 60px; }
+    .comment-reaction .reaction-popup { font-size: 18px; }
+    .comment-summary { margin: 4px 0; font-size: 12px; }
+
+    .reply-btn { background: none; border: none; color: #007bff; font-size: 12px; cursor: pointer; margin-top: 4px; }
+    .show-more-replies { color: #007bff; font-size: 12px; cursor: pointer; margin: 4px 0; text-align: center; }
+    .reply-input-text { flex: 1; margin-right: 8px; }
+    .comment-input { display: flex; gap: 8px; margin-top: 10px; }
+    .comment-input input { flex: 1; }
+    .comment-input button { width: auto; padding: 0 16px; }
+
+    .tag { color: #007bff; cursor: pointer; font-weight: bold; }
+    .tag:hover { text-decoration: underline; }
+    #tagSuggestions { background: white; border: 1px solid #ddd; border-radius: 8px; max-height: 150px; overflow-y: auto; z-index: 100; }
+
+    .story { display: inline-block; margin: 0 10px; text-align: center; cursor: pointer; }
+    .story-avatar { width: 60px; height: 60px; border-radius: 50%; border: 3px solid #6c757d; }
+    .story-name { font-size: 12px; margin-top: 5px; color: #333; }
+
+    /* CHAT STYLES */
+    #chatListView, #chatThreadView { background: rgba(255,255,255,0.97); color: #333; border-radius: 16px; padding: 20px; max-width: 900px; margin: 20px auto; }
+    .chat-item { display: flex; padding: 12px; border-bottom: 1px solid #eee; cursor: pointer; position: relative; }
+    .chat-item:hover { background: #f8f9fa; }
+    .chat-avatar { position: relative; }
+    .chat-avatar img { width: 50px; height: 50px; border-radius: 50%; }
+    .online-dot { position: absolute; bottom: 0; right: 0; width: 12px; height: 12px; border-radius: 50%; border: 2px solid white; }
+    .chat-info { flex: 1; margin-left: 12px; }
+    .chat-info small { color: #666; display: block; }
+    .chat-meta { text-align: right; }
+    .unread-badge { background: #dc3545; color: white; border-radius: 50%; width: 20px; height: 20px; font-size: 11px; display: flex; align-items: center; justify-content: center; }
+
+    #chatHeader { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+    #messagesContainer { height: 58vh; overflow-y: auto; padding: 12px; background: #f8f9fa; border-radius: 12px; margin-bottom: 8px; display: flex; flex-direction: column; gap: 8px; }
+    .message { max-width: 78%; position: relative; animation: fadeIn 0.3s ease; }
+    .message.sent { align-self: flex-end; }
+    .message.received { align-self: flex-start; }
+    .message-content { background: white; padding: 10px 14px; border-radius: 18px; display: inline-block; box-shadow: 0 1px 2px rgba(0,0,0,0.1); word-wrap: break-word; }
+    .message.sent .message-content { background: #007bff; color: white; }
+    .chat-image, .chat-video, .chat-audio { max-width: 240px; border-radius: 14px; margin: 4px 0; display: block; }
+    .chat-video { background: #000; }
+    .chat-audio { width: 220px; height: 50px; background: linear-gradient(90deg, #007bff 0%, #28a745 100%); border-radius: 25px; padding: 8px; display: flex; align-items: center; gap: 10px; color: white; font-size: 12px; }
+    .chat-audio audio { width: 100%; height: 36px; }
+    .message-time { font-size: 11px; color: rgba(255,255,255,0.8); margin-top: 4px; display: block; text-align: right; }
+    .message.sent .message-time { color: rgba(255,255,255,0.9); }
+    .message-status { font-size: 10px; color: #adb5bd; margin-top: 2px; text-align: right; }
+    .message.sent .message-status { color: rgba(255,255,255,0.7); }
+    .reply-preview { font-size: 12px; color: #666; background: #eee; padding: 6px 10px; border-radius: 10px; margin-bottom: 6px; border-left: 3px solid #007bff; }
+    #replyPreview { background: #e9ecef; padding: 10px; border-radius: 12px; margin: 8px 0; font-size: 14px; color: #495057; display: flex; justify-content: space-between; align-items: center; }
+    #replyPreview span { color: #dc3545; font-weight: bold; cursor: pointer; }
+    #typingIndicator { color: #666; font-style: italic; margin: 8px 0; }
+    .upload-progress { position: absolute; bottom: 0; left: 0; right: 0; height: 4px; background: rgba(0,0,0,0.3); border-radius: 0 0 18px 18px; }
+    .upload-progress-bar { height: 100%; background: #28a745; width: 0%; transition: width 0.2s; }
+
+    /* EMOJI PICKER */
+    #emojiPicker {
+      position: absolute; bottom: 70px; left: 10px; width: 340px; background: white; border-radius: 16px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.2); z-index: 1000; display: none; color: #333; max-height: 300px; overflow: hidden;
+    }
+    #emojiTabs { display: flex; border-bottom: 1px solid #eee; background: #f8f9fa; }
+    .emoji-tab { flex: 1; padding: 10px; background: none; border: none; font-size: 14px; cursor: pointer; }
+    .emoji-tab.active { background: white; font-weight: bold; }
+    #emojiContent { max-height: 220px; overflow-y: auto; padding: 12px; }
+    .emoji-tab-content { display: grid; grid-template-columns: repeat(8, 1fr); gap: 8px; }
+    .emoji { font-size: 24px; cursor: pointer; text-align: center; padding: 4px; border-radius: 8px; }
+    .emoji:hover { background: #e9ecef; }
+
+    /* VOICE RECORDING */
+    #voiceStatus { font-size: 12px; color: #dc3545; margin-left: 8px; display: none; }
+
+    @media (max-width: 600px) {
+      header { flex-direction: column; }
+      #logoApp { margin: 10px auto; }
+      #profilePreview { margin: 15px auto; width: 100%; justify-content: center; }
+      .reaction-popup { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); }
+      #messagesContainer { height: 50vh; }
+      #emojiPicker { width: 90%; left: 5%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="overlay">
+    <!-- AUTH -->
+    <div id="authContainer">
+      <div class="logo-container">
+        <img src="logo.png" alt="Nkomazi Link Up" id="logoAuth">
+      </div>
+      <div id="loginForm">
+        <h2>Login</h2>
+        <input type="text" id="loginId" placeholder="Username or Email">
+        <input type="password" id="loginPass" placeholder="Password">
+        <button id="loginBtn">Login</button>
+        <p style="text-align:center; margin-top:15px;">
+          <a href="#" id="resetPassLink">Forgot Password?</a> |
+          <a href="#" id="toRegister">Register</a>
+        </p>
+      </div>
+      <div id="registerForm" style="display:none;">
+        <h2>Create Account</h2>
+        <input type="text" id="regName" placeholder="First Name *" required>
+        <input type="text" id="regSurname" placeholder="Surname *" required>
+        <select id="regGender" required><option value="">Gender *</option><option>Male</option><option>Female</option><option>Other</option></select>
+        <input type="date" id="regDob" required>
+        <input type="text" id="regResidence" placeholder="Current Residence *" required>
+        <input type="text" id="regUsername" placeholder="Username (auto-suggested)">
+        <input type="email" id="regEmail" placeholder="Email *" required>
+        <input type="tel" id="regPhone" placeholder="Phone Number *" required>
+        <input type="password" id="regPass" placeholder="Password (8+ chars) *" required>
+        <input type="password" id="regPassConfirm" placeholder="Confirm Password *" required>
+        <label>Profile Picture (optional)</label>
+        <input type="file" id="regProfilePic" accept="image/*">
+        <h4>Education (Optional)</h4>
+        <input type="text" id="regUni" placeholder="University">
+        <input type="text" id="regQual" placeholder="Qualification">
+        <input type="month" id="regStudyStart" placeholder="Start Year">
+        <input type="month" id="regStudyEnd" placeholder="End Year">
+        <input type="text" id="regOcc" placeholder="Occupation">
+        <select id="regMarital"><option value="">Marital Status</option><option>Single</option><option>Married</option><option>Divorced</option></select>
+        <label><input type="checkbox" id="regExactAge" checked> Show my exact age</label>
+        <button id="registerBtn">Register</button>
+        <p style="text-align:center;"><a href="#" id="toLogin">Back to Login</a></p>
+      </div>
+      <div id="resetForm" style="display:none;">
+        <h2>Reset Password</h2>
+        <input type="email" id="resetEmail" placeholder="Your Email">
+        <button id="resetBtn">Send Reset Link</button>
+        <p style="text-align:center;"><a href="#" id="backToLogin">Back</a></p>
+      </div>
+    </div>
+
+    <!-- APP -->
+    <main id="app" style="display:none;">
+      <header>
+        <img src="logo.png" alt="Nkomazi Link Up" id="logoApp">
+        <nav id="nav" style="display:none;">
+          <button id="feedBtn">Feed</button>
+          <button id="storiesBtn">Stories</button>
+          <button id="searchBtn">Search</button>
+          <button id="communityBtn">Community</button>
+          <button id="chatBtn">Chat <span id="notificationBadge"></span></button>
+          <button id="profileBtn">Profile</button>
+                    <button id="logoutBtn">Logout</button>
+        </nav>
+        <div id="profilePreview" style="display:none;">
+          <img id="profilePic" src="" alt="Profile">
+          <span id="profileName"></span>
+        </div>
+      </header>
+
+      <!-- FEED VIEW -->
+      <div id="feedView">
+        <div class="post-input">
+          <textarea id="postText" placeholder="What's on your mind?" rows="2"></textarea>
+          <div id="tagSuggestions" style="display:none; position:absolute; background:white; border:1px solid #ddd; border-radius:8px; max-height:150px; overflow-y:auto; z-index:100;"></div>
+          <input type="file" id="postImage" accept="image/*">
+          <button id="postBtn">Post</button>
+        </div>
+        <div id="postsList"></div>
+      </div>
+
+      <!-- STORIES VIEW -->
+      <div id="storiesView" style="display:none;">
+        <h3>Add Story</h3>
+        <input type="file" id="storyImage" accept="image/*">
+        <button id="addStoryBtn">Upload Story</button>
+        <div id="storiesList" style="display:flex; overflow-x:auto; gap:15px; margin-top:20px;"></div>
+      </div>
+
+      <!-- STORY FULLSCREEN -->
+      <div id="storyView" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.95); z-index:9999; display:flex; justify-content:center; align-items:center; flex-direction:column;">
+        <img id="storyImage" src="" style="max-width:90%; max-height:90%; border-radius:12px;">
+        <button id="closeStory" style="position:absolute; top:20px; right:20px; background:#fff; color:#000; border:none; padding:10px 15px; border-radius:50%; font-size:20px; cursor:pointer;">X</button>
+      </div>
+
+      <!-- SEARCH VIEW -->
+      <div id="searchView" style="display:none;">
+        <div style="display:flex; gap:10px;">
+          <input type="text" id="searchQuery" placeholder="Search by name...">
+          <button id="searchBtnExec">Search</button>
+        </div>
+        <div id="searchResults" style="margin-top:20px;"></div>
+      </div>
+
+      <!-- COMMUNITY VIEW -->
+      <div id="communityView" style="display:none;">
+        <h3>Community</h3>
+        <div id="communityList"></div>
+      </div>
+
+      <!-- PROFILE VIEW -->
+      <div id="profileView" style="display:none;">
+        <div id="profileContent"></div>
+      </div>
+
+      <!-- EDIT PROFILE VIEW -->
+      <div id="editProfileView" style="display:none;">
+        <h3>Edit Profile</h3>
+        <input type="text" id="editName" placeholder="First Name">
+        <input type="text" id="editSurname" placeholder="Surname">
+        <textarea id="editBio" placeholder="Bio"></textarea>
+        <input type="text" id="editResidence" placeholder="Residence">
+        <input type="file" id="editProfilePic" accept="image/*">
+        <h4>Education</h4>
+        <input type="text" id="editUni" placeholder="University">
+        <input type="text" id="editQual" placeholder="Qualification">
+        <input type="month" id="editStudyStart">
+        <input type="month" id="editStudyEnd">
+        <input type="text" id="editOcc" placeholder="Occupation">
+        <select id="editMarital">
+          <option value="">Marital Status</option>
+          <option>Single</option>
+          <option>Married</option>
+          <option>Divorced</option>
+        </select>
+        <button id="saveProfileBtn">Save</button>
+      </div>
+
+      <!-- CHAT LIST VIEW -->
+      <div id="chatListView" style="display:none;">
+        <h3>Messages</h3>
+        <div id="chatList"></div>
+      </div>
+
+      <!-- CHAT THREAD VIEW (WITH EMOJI + VOICE) -->
+      <div id="chatThreadView" style="display:none;">
+        <div id="chatHeader"><strong id="chatWith"></strong></div>
+        <div id="messagesContainer"></div>
+        <div id="typingIndicator" style="display:none;"></div>
+        <div id="replyPreview" style="display:none;"></div>
+
+        <!-- BIGGER INPUT + COMPACT BUTTONS + EMOJI + VOICE -->
+        <div style="display:flex; gap:8px; align-items:flex-end; background:#fff; padding:14px; border-radius:16px; box-shadow:0 -2px 12px rgba(0,0,0,0.1); position:relative;">
+          
+          <!-- REPLY PREVIEW INSIDE INPUT AREA -->
+          <div id="replyPreviewInside" style="display:none; background:#e9ecef; padding:8px 12px; border-radius:12px; font-size:13px; color:#495057; margin-bottom:8px; width:100%; display:flex; justify-content:space-between;">
+            <span id="replyText"></span>
+            <span onclick="clearReply()" style="cursor:pointer; color:#dc3545; font-weight:bold;">×</span>
+          </div>
+
+          <textarea 
+            id="msgInput" 
+            placeholder="Type a message..." 
+            rows="2" 
+            style="flex:1; resize:none; padding:12px 14px; border:1px solid #ddd; border-radius:14px; font-size:16px; line-height:1.5; max-height:140px; min-height:48px;"
+            oninput="autoResize(this); handleTyping();"
+            onkeydown="if(event.key==='Enter' && !event.shiftKey){ event.preventDefault(); sendMessage(this.value); this.value=''; autoResize(this); }">
+          </textarea>
+
+          <!-- EMOJI BUTTON -->
+          <button id="emojiBtn" style="width:38px; height:38px; padding:0; background:#6c757d; color:white; border:none; border-radius:50%; font-size:18px; display:flex; align-items:center; justify-content:center; cursor:pointer;" title="Emoji">
+            Emoji
+          </button>
+
+          <!-- VOICE RECORD BUTTON -->
+          <button id="voiceBtn" style="width:38px; height:38px; padding:0; background:#6c757d; color:white; border:none; border-radius:50%; font-size:18px; display:flex; align-items:center; justify-content:center; cursor:pointer;" title="Hold to Record">
+            Mic
+          </button>
+          <span id="voiceStatus" style="font-size:12px; color:#dc3545; margin-left:8px; display:none;">Recording...</span>
+
+          <!-- HIDDEN MEDIA INPUT -->
+          <input type="file" id="chatMedia" accept="image/*,video/*,audio/*" style="display:none;">
+          <button id="sendMedia" onclick="document.getElementById('chatMedia').click()" style="width:38px; height:38px; padding:0; background:#007bff; color:white; border:none; border-radius:50%; font-size:18px; display:flex; align-items:center; justify-content:center; cursor:pointer; display:none;" title="Attach">
+            Media
+          </button>
+
+          <!-- SEND BUTTON -->
+          <button 
+            id="sendBtn" 
+            onclick="sendMessage(document.getElementById('msgInput').value); document.getElementById('msgInput').value=''; autoResize(document.getElementById('msgInput'));" 
+            style="width:38px; height:38px; padding:0; background:#28a745; color:white; border:none; border-radius:50%; font-size:18px; display:flex; align-items:center; justify-content:center; cursor:pointer;"
+            title="Send">
+            Send
+          </button>
+        </div>
+
+        <!-- EMOJI PICKER -->
+        <div id="emojiPicker" style="display:none;">
+          <div id="emojiTabs"></div>
+          <div id="emojiContent"></div>
+        </div>
+      </div>
+    </main>
+  </div>
+</body>
+</html>
